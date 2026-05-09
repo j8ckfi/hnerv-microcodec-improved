@@ -33,6 +33,9 @@ DECODER_STORAGE_ORDER = (
     14, 22, 7, 6, 19, 10, 25, 4, 20, 9, 12, 15, 5, 11,
     18, 1, 21, 3, 27, 13, 2, 26, 24, 17, 16, 23, 8, 0,
 )
+# Cumulative cut points into DECODER_STORAGE_ORDER: tensors at positions
+# [0:1], [1:2], [2:22], ... are each compressed as one Brotli stream and
+# concatenated. Cuts are chosen so similar weight statistics share a stream.
 DECODER_STREAM_ENDS = (1, 2, 22, 23, 26, 27, 28)
 
 CONV4_STORAGE_PERMS = {
@@ -108,7 +111,8 @@ def unpack_3bit_lengths(data, n, offset):
     return out
 
 
-def decode_canonical_huffman(data, lengths, n_symbols):
+def _build_canonical_huffman_table(lengths):
+    """Map (code_len, code) -> symbol for a canonical Huffman code."""
     decode = {}
     code = 0
     prev_len = 0
@@ -120,7 +124,11 @@ def decode_canonical_huffman(data, lengths, n_symbols):
         decode[(length, code)] = sym
         code += 1
         prev_len = length
+    return decode
 
+
+def decode_canonical_huffman(data, lengths, n_symbols):
+    decode = _build_canonical_huffman_table(lengths)
     out = np.empty(n_symbols, dtype=np.uint8)
     out_pos = 0
     cur = 0
@@ -141,18 +149,7 @@ def decode_canonical_huffman(data, lengths, n_symbols):
 
 
 def decode_canonical_huffman_all(data, lengths):
-    decode = {}
-    code = 0
-    prev_len = 0
-    for sym, length in sorted(
-        ((sym, int(length)) for sym, length in enumerate(lengths) if length),
-        key=lambda x: (x[1], x[0]),
-    ):
-        code <<= length - prev_len
-        decode[(length, code)] = sym
-        code += 1
-        prev_len = length
-
+    decode = _build_canonical_huffman_table(lengths)
     out = []
     cur = 0
     cur_len = 0
@@ -168,6 +165,17 @@ def decode_canonical_huffman_all(data, lengths):
     if cur_len:
         raise ValueError("truncated Huffman sidecar")
     return np.array(out, dtype=np.uint8)
+
+
+def _unpack_packed_dims(buf, n_valid):
+    """Decode n_valid base-LATENT_DIM digits from a little-endian integer."""
+    value = int.from_bytes(buf, "little")
+    dims = np.empty(n_valid, dtype=np.int64)
+    for i in range(n_valid):
+        value, dims[i] = divmod(value, LATENT_DIM)
+    if value:
+        raise ValueError("bad sidecar dimensions")
+    return dims
 
 
 @lru_cache(None)
@@ -305,12 +313,17 @@ def decode_latents_compact(data):
     if stored.size != N_PAIRS * LATENT_DIM:
         raise ValueError("truncated compact latent payload")
     delta_ordered = stored.reshape(LATENT_DIM, N_PAIRS)
+    # Encoder stores: byte 0 = q[0], byte t>=1 = (q[t] - q[t-1] + 128) mod 256.
+    # Reconstruct q[t] = (q[0] + sum_{s=1..t}(delta[s] - 128)) mod 256.
+    # Per-step centered deltas live in -128..127 and fit int8; cumulating in
+    # int32 then masking to 8 bits is equivalent and avoids relying on the
+    # uint16->uint8 truncation invariant in the original implementation.
+    centered = (delta_ordered[:, 1:].astype(np.int16) - 128).astype(np.int8)
     q_ordered = delta_ordered.copy()
-    q_ordered[:, 1:] = np.cumsum(
-        ((delta_ordered[:, 1:].astype(np.int16) - 128) & 255),
-        axis=1,
-        dtype=np.uint16,
-    ).astype(np.uint8) + delta_ordered[:, :1]
+    q_ordered[:, 1:] = (
+        delta_ordered[:, :1].astype(np.int32)
+        + np.cumsum(centered.astype(np.int32), axis=1)
+    ).astype(np.uint8)
     q_ordered = q_ordered.T.copy()
     q = np.empty((N_PAIRS, LATENT_DIM), dtype=np.uint8)
     q[:, LATENT_DIM_ORDER] = q_ordered
@@ -349,12 +362,7 @@ def apply_latent_sidecar(latents, data):
         if int(valid_mask.sum()) != n_valid:
             raise ValueError("bad compact Huffman sidecar no-op count")
 
-        value = int.from_bytes(raw[:dim_end], "little")
-        dims_valid = np.empty(n_valid, dtype=np.int64)
-        for i in range(n_valid):
-            value, dims_valid[i] = divmod(value, LATENT_DIM)
-        if value:
-            raise ValueError("bad compact Huffman sidecar dimensions")
+        dims_valid = _unpack_packed_dims(raw[:dim_end], n_valid)
 
         dims = np.full(N_PAIRS, 255, dtype=np.int64)
         codes = np.zeros(N_PAIRS, dtype=np.float32)
@@ -370,12 +378,7 @@ def apply_latent_sidecar(latents, data):
 
         dim_start = SIDECAR_NOOP_RANK_PREFIX_LEN
         dim_end = dim_start + SIDECAR_DIM_PACKED_LEN
-        value = int.from_bytes(raw[dim_start:dim_end], "little")
-        dims_valid = np.empty(n_valid, dtype=np.int64)
-        for i in range(n_valid):
-            value, dims_valid[i] = divmod(value, LATENT_DIM)
-        if value:
-            raise ValueError("bad compact Huffman sidecar dimensions")
+        dims_valid = _unpack_packed_dims(raw[dim_start:dim_end], n_valid)
 
         len_start = dim_end
         len_end = len_start + SIDECAR_DELTA_HUFF3_LENGTHS_LEN
@@ -403,12 +406,7 @@ def apply_latent_sidecar(latents, data):
 
         dim_start = SIDECAR_NOOP_TABLE_LEN
         dim_end = dim_start + SIDECAR_DIM_PACKED_LEN
-        value = int.from_bytes(raw[dim_start:dim_end], "little")
-        dims_valid = np.empty(n_valid, dtype=np.int64)
-        for i in range(n_valid):
-            value, dims_valid[i] = divmod(value, LATENT_DIM)
-        if value:
-            raise ValueError("bad split sidecar dimensions")
+        dims_valid = _unpack_packed_dims(raw[dim_start:dim_end], n_valid)
 
         if arr.size == SIDECAR_HUFF_LEN:
             len_start = dim_end
